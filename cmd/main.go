@@ -31,6 +31,7 @@ func JoinQueue(c echo.Context) error {
 		return c.NoContent(http.StatusBadRequest)
 	}
 
+	log.Println("Player", id, "joined queue")
 	queue.Enqueue(id, conn)
 	return nil
 }
@@ -40,17 +41,30 @@ func init() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
+	go queue.Tick()
 }
 
 func main() {
-	log.Println("Startig RPS Matchmaking Service")
 	secret := os.Getenv("JWT_SECRET")
 	if secret == "" {
 		log.Fatal("JWT_SECRET is missing")
 	}
 	e := echo.New()
+	e.HideBanner = true
+	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if c.Request().Header.Get("Authorization") == "" {
+				cookie, err := c.Cookie("access_token")
+				if err == nil {
+					c.Request().Header.Set("Authorization", "Bearer "+cookie.Value)
+				}
+			}
+			return next(c)
+		}
+	})
 	e.Use(echojwt.JWT([]byte(secret)))
 	e.Use(utils.ExtractPlayerID)
 	e.GET("/", JoinQueue)
+	log.Println("Startig RPS Matchmaking Service")
 	e.Logger.Fatal(e.Start(":" + os.Getenv("PORT")))
 }

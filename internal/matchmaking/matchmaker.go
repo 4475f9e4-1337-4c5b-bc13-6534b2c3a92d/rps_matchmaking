@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"rps_matchmaking/internal/utils"
+	"strconv"
 	"sync"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 )
 
 const PendingTimeout = 30 * time.Second
-const PingTimeout = 10 * time.Second
+const PingTimeout = 1 * time.Second
 
 type Status int
 
@@ -27,14 +28,15 @@ const (
 type MessageType int
 
 const (
-	CancelQueue MessageType = iota
-	PopQueue
-	AcceptQueue
-	AcceptQueueResponse
+	CancelQueue         MessageType = 0
+	PopQueue            MessageType = 1
+	AcceptQueue         MessageType = 2
+	AcceptQueueResponse MessageType = 3
 )
 
 type BaseMessage struct {
-	Type MessageType `json:"type"`
+	Headers interface{} `json:"HEADERS"`
+	Type    string      `json:"type"`
 }
 
 type CancelQueueMessage struct {
@@ -68,6 +70,8 @@ type Player struct {
 	conn   *websocket.Conn
 	mq     *MatchmakingQueue
 	send   chan []byte
+	timer  *time.Ticker
+	time   time.Time
 }
 
 type PendingMatch struct {
@@ -88,7 +92,7 @@ type MatchmakingQueue struct {
 
 func (p *Player) read() {
 	defer func() {
-		p.mq.cancel <- p
+		p.Cancel()
 	}()
 
 	for {
@@ -102,9 +106,16 @@ func (p *Player) read() {
 		if ok := utils.UnmarshalMessage(msg, &baseMsg); !ok {
 			continue
 		}
+		msgTypeInt, err := strconv.Atoi(baseMsg.Type)
+		if err != nil {
+			log.Println("Error parsing message type:", err)
+			continue
+		}
+		msgType := MessageType(msgTypeInt)
 
-		switch baseMsg.Type {
+		switch msgType {
 		case CancelQueue:
+			p.mq.Remove(p.id)
 			return
 		case AcceptQueue:
 			var acceptMsg AcceptQueueMessage
@@ -120,10 +131,8 @@ func (p *Player) read() {
 }
 
 func (p *Player) write() {
-	ticker := time.NewTicker(PingTimeout)
 	defer func() {
-		ticker.Stop()
-		p.mq.cancel <- p
+		p.Cancel()
 	}()
 
 	for {
@@ -133,18 +142,26 @@ func (p *Player) write() {
 				p.conn.WriteMessage(websocket.CloseMessage, nil)
 				return
 			}
-			p.conn.WriteMessage(websocket.TextMessage, msg)
-
-		case <-ticker.C:
-			if err := p.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			err := p.conn.WriteMessage(websocket.TextMessage, msg)
+			if err != nil {
+				log.Println("Error writing msg:", err)
+				return
+			}
+		case <-p.timer.C:
+			if err := p.conn.WriteMessage(websocket.TextMessage, []byte(renderQueueTimer(p))); err != nil {
+				log.Println("Error writing Timer:", err)
 				return
 			}
 		}
 	}
 }
 
+func (p *Player) Cancel() {
+	p.timer.Stop()
+	p.mq.cancel <- p
+}
+
 // TODO: Implement pending and timeout and accept queue
-// TODO: Implement cancel and decline queue
 
 func (mq *MatchmakingQueue) Enqueue(pid string, conn *websocket.Conn) *Player {
 	mq.mutex.Lock()
@@ -154,6 +171,8 @@ func (mq *MatchmakingQueue) Enqueue(pid string, conn *websocket.Conn) *Player {
 		conn:   conn,
 		mq:     mq,
 		send:   make(chan []byte),
+		time:   time.Now(),
+		timer:  time.NewTicker(PingTimeout),
 	}
 	node := mq.queue.PushBack(p)
 	mq.hash[pid] = node
@@ -178,15 +197,16 @@ func (mq *MatchmakingQueue) Dequeue() *Player {
 
 func (mq *MatchmakingQueue) Remove(pid string) *Player {
 	mq.mutex.Lock()
+	defer mq.mutex.Unlock()
 	node, ok := mq.hash[pid]
 	if !ok {
-		mq.mutex.Unlock()
 		return nil
 	}
 	player := mq.queue.Remove(node).(*Player)
 	delete(mq.hash, pid)
-	mq.mutex.Unlock()
 	player.status = Cancelled
+	log.Println("Player", pid, "cancelled and removed")
+	player.send <- []byte(renderRedirect("/profile"))
 	return player
 }
 
@@ -214,7 +234,7 @@ func (mq *MatchmakingQueue) Run() {
 	// TODO: Get match ID from Game Service
 	matchID := uuid.New().String()
 	pqm := PopQueueMessage{
-		BaseMessage: BaseMessage{Type: PopQueue},
+		BaseMessage: BaseMessage{Type: strconv.Itoa(int(PopQueue))},
 		MatchID:     matchID,
 		Timeout:     time.Now().Add(PendingTimeout).Unix(),
 	}
@@ -223,10 +243,26 @@ func (mq *MatchmakingQueue) Run() {
 		log.Println("Error marshalling message:", err)
 		return
 	}
-	player1.send <- msg
-	player2.send <- msg
+	log.Println("Match Found:", msg)
+
+	// TODO: Send match ID to Game Service
+	html := renderQueuePop(pqm)
+	buf := []byte(html)
+	player1.send <- buf
+	player2.send <- buf
 
 	// TODO: handle pending and timeout
+}
+
+func (mq *MatchmakingQueue) Tick() {
+	go func() {
+		for {
+			select {
+			case p := <-mq.cancel:
+				mq.Remove(p.id)
+			}
+		}
+	}()
 }
 
 func NewMatchmakingQueue() *MatchmakingQueue {
@@ -237,4 +273,22 @@ func NewMatchmakingQueue() *MatchmakingQueue {
 		cancel:  make(chan *Player),
 		mutex:   &sync.Mutex{},
 	}
+}
+
+func renderRedirect(url string) string {
+	return `<div id="queue-data" hx-swap-oob="true" hx-get="` + url + `" hx-trigger="load" hx-target="body" hx-swap="outerHTML"></div>`
+}
+
+func renderQueueTimer(p *Player) string {
+	qTime := time.Now().Sub(p.time)
+	elapsed := strconv.Itoa(int(qTime.Seconds()))
+	return `<span id="queue-timer" hx-swap-oob="true" class="text-lg font-bold">` + elapsed + ` s</span>`
+}
+
+func renderQueuePop(data PopQueueMessage) string {
+	return `<div id="queue-data" hx-swap-oob="true">
+			<h1>Match Found</h1>
+			<p>Match ID: ` + data.MatchID + `</p>
+			<p>Timeout: ` + time.Unix(data.Timeout, 0).String() + `</p>
+		</div>`
 }
