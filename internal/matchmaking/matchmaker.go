@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -64,16 +63,6 @@ type ServerInfoMessage struct {
 	ServerPort int    `json:"server_port"`
 }
 
-type Player struct {
-	id     string
-	status Status
-	conn   *websocket.Conn
-	mq     *MatchmakingQueue
-	send   chan []byte
-	timer  *time.Ticker
-	time   time.Time
-}
-
 type PendingMatch struct {
 	player1Ready bool
 	player2Ready bool
@@ -82,23 +71,36 @@ type PendingMatch struct {
 	timeout      time.Time
 }
 
+type Player struct {
+	id     string
+	mode   string
+	bestof int
+	status Status
+	conn   *websocket.Conn
+	mq     *MatchmakingQueue
+	send   chan []byte
+	timer  *time.Ticker
+	time   time.Time
+}
+
 type MatchmakingQueue struct {
+	token   string
 	queue   *list.List
 	hash    map[string]*list.Element
 	pending map[string]*PendingMatch
+	join    chan *Player
 	cancel  chan *Player
-	mutex   *sync.Mutex
+	mutex   *sync.RWMutex
 }
 
 func (p *Player) read() {
 	defer func() {
-		p.Cancel()
+		p.mq.cancel <- p
 	}()
 
 	for {
 		_, msg, err := p.conn.ReadMessage()
 		if err != nil {
-			log.Println("read err:", err)
 			break
 		}
 
@@ -116,7 +118,6 @@ func (p *Player) read() {
 		switch msgType {
 		case CancelQueue:
 			p.mq.Remove(p.id)
-			return
 		case AcceptQueue:
 			var acceptMsg AcceptQueueMessage
 			if ok := utils.UnmarshalMessage(msg, &acceptMsg); !ok {
@@ -132,7 +133,9 @@ func (p *Player) read() {
 
 func (p *Player) write() {
 	defer func() {
-		p.Cancel()
+		close(p.send)
+		p.timer.Stop()
+		p.mq.cancel <- p
 	}()
 
 	for {
@@ -144,29 +147,24 @@ func (p *Player) write() {
 			}
 			err := p.conn.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
-				log.Println("Error writing msg:", err)
 				return
 			}
 		case <-p.timer.C:
 			if err := p.conn.WriteMessage(websocket.TextMessage, []byte(renderQueueTimer(p))); err != nil {
-				log.Println("Error writing Timer:", err)
 				return
 			}
 		}
 	}
 }
 
-func (p *Player) Cancel() {
-	p.timer.Stop()
-	p.mq.cancel <- p
-}
-
 // TODO: Implement pending and timeout and accept queue
 
-func (mq *MatchmakingQueue) Enqueue(pid string, conn *websocket.Conn) *Player {
+func (mq *MatchmakingQueue) Enqueue(pid, mode string, bestof int, conn *websocket.Conn) *Player {
 	mq.mutex.Lock()
 	p := &Player{
 		id:     pid,
+		mode:   mode,
+		bestof: bestof,
 		status: Queued,
 		conn:   conn,
 		mq:     mq,
@@ -178,6 +176,9 @@ func (mq *MatchmakingQueue) Enqueue(pid string, conn *websocket.Conn) *Player {
 	mq.hash[pid] = node
 	mq.mutex.Unlock()
 
+	go func() {
+		mq.join <- p
+	}()
 	go p.read()
 	go p.write()
 	return p
@@ -205,8 +206,8 @@ func (mq *MatchmakingQueue) Remove(pid string) *Player {
 	player := mq.queue.Remove(node).(*Player)
 	delete(mq.hash, pid)
 	player.status = Cancelled
-	log.Println("Player", pid, "cancelled and removed")
-	player.send <- []byte(renderRedirect("/profile"))
+	log.Println("player", pid, "removed")
+	player.send <- []byte(renderRedirect("/profile/menu"))
 	return player
 }
 
@@ -218,21 +219,34 @@ func (mq *MatchmakingQueue) PushFront(player *Player) {
 	player.status = Queued
 }
 
-func (mq *MatchmakingQueue) Run() {
-	mq.mutex.Lock()
-	defer mq.mutex.Unlock()
+func (mq *MatchmakingQueue) run() {
 
+	log.Println("Running Matchmaking")
+	mq.mutex.RLock()
 	if mq.queue.Len() < 2 {
+		mq.mutex.RUnlock()
 		return
 	}
+	mq.mutex.RUnlock()
 
 	player1 := mq.Dequeue()
 	player2 := mq.Dequeue()
 	player1.status = Pending
 	player2.status = Pending
 
-	// TODO: Get match ID from Game Service
-	matchID := uuid.New().String()
+	settings := utils.GameSettings{
+		GameMode:  "rps",
+		Type:      player1.mode,
+		BestOf:    max(player1.bestof, player2.bestof),
+		PlayerOne: player1.id,
+		PlayerTwo: player2.id,
+	}
+	matchID, err := utils.GetNewServerID(settings)
+	if err != nil {
+		log.Println("Error getting server ID:", err)
+		return
+	}
+
 	pqm := PopQueueMessage{
 		BaseMessage: BaseMessage{Type: strconv.Itoa(int(PopQueue))},
 		MatchID:     matchID,
@@ -243,9 +257,8 @@ func (mq *MatchmakingQueue) Run() {
 		log.Println("Error marshalling message:", err)
 		return
 	}
-	log.Println("Match Found:", msg)
+	log.Println("Match Found:", string(msg))
 
-	// TODO: Send match ID to Game Service
 	html := renderQueuePop(pqm)
 	buf := []byte(html)
 	player1.send <- buf
@@ -254,29 +267,38 @@ func (mq *MatchmakingQueue) Run() {
 	// TODO: handle pending and timeout
 }
 
-func (mq *MatchmakingQueue) Tick() {
-	go func() {
-		for {
-			select {
-			case p := <-mq.cancel:
-				mq.Remove(p.id)
-			}
+func (mq *MatchmakingQueue) tick() {
+	for {
+		select {
+		case p := <-mq.cancel:
+			p.conn.Close()
+		case <-mq.join:
+			mq.run()
 		}
-	}()
-}
-
-func NewMatchmakingQueue() *MatchmakingQueue {
-	return &MatchmakingQueue{
-		queue:   list.New(),
-		hash:    make(map[string]*list.Element),
-		pending: make(map[string]*PendingMatch),
-		cancel:  make(chan *Player),
-		mutex:   &sync.Mutex{},
 	}
 }
 
+func NewMatchmakingQueue() (*MatchmakingQueue, error) {
+	token, err := utils.CreateJWT("matchmaker")
+	if err != nil {
+		log.Fatal("Error creating JWT:", err)
+		return nil, err
+	}
+	q := &MatchmakingQueue{
+		token:   token,
+		queue:   list.New(),
+		hash:    make(map[string]*list.Element),
+		pending: make(map[string]*PendingMatch),
+		join:    make(chan *Player),
+		cancel:  make(chan *Player),
+		mutex:   &sync.RWMutex{},
+	}
+	go q.tick()
+	return q, nil
+}
+
 func renderRedirect(url string) string {
-	return `<div id="queue-data" hx-swap-oob="true" hx-get="` + url + `" hx-trigger="load" hx-target="body" hx-swap="outerHTML"></div>`
+	return `<div id="queue-data" hx-swap-oob="true" hx-get="` + url + `" hx-trigger="load" hx-target="#game-menu" hx-swap="outerHTML"></div>`
 }
 
 func renderQueueTimer(p *Player) string {
@@ -286,9 +308,5 @@ func renderQueueTimer(p *Player) string {
 }
 
 func renderQueuePop(data PopQueueMessage) string {
-	return `<div id="queue-data" hx-swap-oob="true">
-			<h1>Match Found</h1>
-			<p>Match ID: ` + data.MatchID + `</p>
-			<p>Timeout: ` + time.Unix(data.Timeout, 0).String() + `</p>
-		</div>`
+	return `<div id="queue-data" hx-swap-oob="true"	hx-get="/game/` + data.MatchID + `" hx-target="#game-menu" hx-trigger="load" hx-swap="innerHTML" </div>`
 }

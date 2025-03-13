@@ -6,6 +6,7 @@ import (
 	"os"
 	"rps_matchmaking/internal/matchmaking"
 	"rps_matchmaking/internal/utils"
+	"strconv"
 
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
@@ -17,11 +18,13 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-var queue = matchmaking.NewMatchmakingQueue()
+var queue *matchmaking.MatchmakingQueue
 
 func JoinQueue(c echo.Context) error {
 	id, ok := c.Get("playerID").(string)
-	if !ok {
+	bestOf := c.QueryParam("bestOf")
+	mode := c.QueryParam("type")
+	if !ok || bestOf == "" || mode == "" {
 		return c.NoContent(http.StatusUnauthorized)
 	}
 
@@ -31,8 +34,13 @@ func JoinQueue(c echo.Context) error {
 		return c.NoContent(http.StatusBadRequest)
 	}
 
-	log.Println("Player", id, "joined queue")
-	queue.Enqueue(id, conn)
+	best, err := strconv.Atoi(bestOf)
+	if err != nil {
+		best = 3
+	}
+
+	log.Println("joining queue", id)
+	queue.Enqueue(id, mode, best, conn)
 	return nil
 }
 
@@ -41,7 +49,10 @@ func init() {
 	if err != nil {
 		log.Fatal("Error loading .env file")
 	}
-	go queue.Tick()
+	queue, err = matchmaking.NewMatchmakingQueue()
+	if err != nil {
+		log.Fatal("Error creating matchmaking queue")
+	}
 }
 
 func main() {

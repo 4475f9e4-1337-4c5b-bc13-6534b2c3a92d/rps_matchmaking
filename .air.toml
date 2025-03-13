@@ -41,5 +41,5 @@
 
 [proxy]
   enabled = true
-  proxy_port = 9101
+  proxy_port = 3100
   app_port = 9100

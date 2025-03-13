@@ -1,29 +1,88 @@
 package utils
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/labstack/echo/v4"
 )
 
-func ValidateToken(token string) (interface{}, error) {
-	parsedToken, err := jwt.Parse(token, func(t *jwt.Token) (interface{}, error) {
-		secret := []byte(os.Getenv("JWT_SECRET"))
-		return secret, nil
-	})
+type GameSettings struct {
+	GameMode  string `json:"gamemode"`
+	Type      string `json:"game_type"`
+	BestOf    int    `json:"bestOf"`
+	PlayerOne string `json:"playerOne"`
+	PlayerTwo string `json:"playerTwo,omitempty"`
+}
+
+type NewServerResponse struct {
+	ServerID string `json:"server_id"`
+}
+
+func GetNewServerID(settings GameSettings) (string, error) {
+	url := os.Getenv("GAME_SERVER_URI")
+	if url == "" {
+		return "", errors.New("GAME_SERVER_URI is missing")
+	}
+	url = url + "/game"
+
+	settingsJson, err := json.Marshal(settings)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 
-	if claims, ok := parsedToken.Claims.(jwt.MapClaims); ok && parsedToken.Valid {
-		return claims, nil
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(settingsJson))
+	if err != nil {
+		return "", errors.New("Failed to create request")
 	}
-	return nil, errors.New("Invalid token")
+	token, err := CreateJWT("matchmaker")
+	if err != nil {
+		return "", err
+	}
+	req.Header.Add("Accept", "application/json")
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", errors.New("Failed to get server ID")
+	}
+
+	var newServerResponse NewServerResponse
+	if ok := UnmarshalMessage(body, &newServerResponse); !ok {
+		return "", errors.New("Failed to unmarshal response")
+	}
+
+	return newServerResponse.ServerID, nil
+}
+
+func CreateJWT(payload string) (string, error) {
+	secret := []byte(os.Getenv("JWT_MM_SECRET"))
+	now := time.Now().UTC()
+	claims := make(jwt.MapClaims)
+	claims["sub"] = payload
+	claims["exp"] = now.Add(time.Hour * 24 * 3).Unix()
+	claims["iat"] = now.Unix()
+	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(secret)
+	if err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func UnmarshalMessage[T any](data []byte, v *T) bool {
